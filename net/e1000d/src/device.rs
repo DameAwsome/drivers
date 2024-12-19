@@ -1,365 +1,414 @@
-use std::convert::TryInto;
-use std::{cmp, mem, ptr, slice};
+#![no_std]
+#![deny(unsafe_code)]
+#![feature(strict_provenance)]
 
-use driver_network::NetworkAdapter;
+extern crate alloc;
+use alloc::boxed::Box;
+use crate::alloc::string::ToString;
+use alloc::sync::Arc;
+use aster_virtio::device::block::DEVICE_NAME;
+use aster_virtio::device::socket::buffer;
+use aster_virtio::device::network::header::VirtioNetHdr;
+use ostd::mm;
+use ostd::mm::VmIoOnce;
+use ostd::mm::{VmReader,DmaDirection,DmaStream,VmWriter,FrameAllocOptions};
+use ostd::prelude::println;
+use ostd::bus::pci::common_device::PciCommonDevice;
+use ostd::bus::pci::cfg_space::Bar;
+use ostd::bus::pci::cfg_space::MemoryBar;
+use ostd::sync::{Mutex,SpinLock,LocalIrqDisabled};
+use ostd::bus::BusProbeError;
+use ostd::bus::pci::PCI_BUS;
+use ostd::Pod;
+use ostd::bus::pci::bus::PciDevice;
+use ostd::bus::pci::bus::PciDriver;
+use alloc::{vec::Vec};
+use ostd::io_mem::IoMem;
+use component::{init_component, ComponentInitError};
+use ostd::bus::pci::PciDeviceId;
+use aster_network::{DmaSegment, RxBuffer, TxBuffer,AnyNetworkDevice,VirtioNetError,EthernetAddr};
+use aster_bigtcp::device::DeviceCapabilities;
+use core::fmt::Debug;
+use alloc::{fmt, slice};
+use alloc::collections::linked_list::LinkedList;
+use aster_network::dma_pool;
+use ostd::bus::pci::cfg_space::AddrLen;
+use aster_util::{field_ptr, safe_ptr::SafePtr};
+use ostd::mm::{DmaCoherent, HasDaddr, HasPaddr, Paddr, VmIo};
+use core::mem;
 
-use syscall::error::Result;
-
-use common::dma::Dma;
-
-const CTRL: u32 = 0x00;
-const CTRL_LRST: u32 = 1 << 3;
-const CTRL_ASDE: u32 = 1 << 5;
-const CTRL_SLU: u32 = 1 << 6;
-const CTRL_ILOS: u32 = 1 << 7;
-const CTRL_RST: u32 = 1 << 26;
-const CTRL_VME: u32 = 1 << 30;
-const CTRL_PHY_RST: u32 = 1 << 31;
-
-const STATUS: u32 = 0x08;
-
-const FCAL: u32 = 0x28;
-const FCAH: u32 = 0x2C;
-const FCT: u32 = 0x30;
-const FCTTV: u32 = 0x170;
-
-const ICR: u32 = 0xC0;
-
-const IMS: u32 = 0xD0;
-const IMS_TXDW: u32 = 1;
-const IMS_TXQE: u32 = 1 << 1;
-const IMS_LSC: u32 = 1 << 2;
-const IMS_RXSEQ: u32 = 1 << 3;
-const IMS_RXDMT: u32 = 1 << 4;
-const IMS_RX: u32 = 1 << 6;
-const IMS_RXT: u32 = 1 << 7;
-
-const RCTL: u32 = 0x100;
-const RCTL_EN: u32 = 1 << 1;
-const RCTL_UPE: u32 = 1 << 3;
-const RCTL_MPE: u32 = 1 << 4;
-const RCTL_LPE: u32 = 1 << 5;
-const RCTL_LBM: u32 = 1 << 6 | 1 << 7;
-const RCTL_BAM: u32 = 1 << 15;
-const RCTL_BSIZE1: u32 = 1 << 16;
-const RCTL_BSIZE2: u32 = 1 << 17;
-const RCTL_BSEX: u32 = 1 << 25;
-const RCTL_SECRC: u32 = 1 << 26;
-
-const RDBAL: u32 = 0x2800;
-const RDBAH: u32 = 0x2804;
-const RDLEN: u32 = 0x2808;
-const RDH: u32 = 0x2810;
-const RDT: u32 = 0x2818;
-
-const RAL0: u32 = 0x5400;
-const RAH0: u32 = 0x5404;
-
-#[derive(Debug, Copy, Clone)]
-#[repr(packed)]
-struct Rd {
-    buffer: u64,
-    length: u16,
-    checksum: u16,
-    status: u8,
-    error: u8,
-    special: u16,
+const OFFSET:usize = 16384;
+const TDOFFSET:usize = mem::size_of::<TD>();
+const RDOFFSET:usize = mem::size_of::<TD>();
+const RD_DD :u8 = 1;
+const RDT : usize = 0x2818;
+#[init_component]
+fn e1000_init() -> Result<(), ComponentInitError> {
+    driver_e1000_init();
+    Ok(())
 }
-const RD_DD: u8 = 1;
-const RD_EOP: u8 = 1 << 1;
 
-const TCTL: u32 = 0x400;
-const TCTL_EN: u32 = 1 << 1;
-const TCTL_PSP: u32 = 1 << 3;
-
-const TDBAL: u32 = 0x3800;
-const TDBAH: u32 = 0x3804;
-const TDLEN: u32 = 0x3808;
-const TDH: u32 = 0x3810;
-const TDT: u32 = 0x3818;
-
-#[derive(Debug, Copy, Clone)]
-#[repr(packed)]
-struct Td {
-    buffer: u64,
-    length: u16,
-    cso: u8,
-    command: u8,
-    status: u8,
-    css: u8,
-    special: u16,
+/// The dma descriptor for transmitting 1
+#[derive(Debug, Clone,Pod,Copy)]
+#[repr(C, align(16))]
+pub struct TD {
+addr: u64,
+length: usize,
+cso: u8,
+cmd: u8,
+status: u8,
+css: u8,
+special: u16,
 }
-const TD_CMD_EOP: u8 = 1;
-const TD_CMD_IFCS: u8 = 1 << 1;
-const TD_CMD_RS: u8 = 1 << 3;
-const TD_DD: u8 = 1;
-
-pub struct Intel8254x {
+/// [E1000 3.2.3]
+/// The dma descriptor for receiving
+#[derive(Debug, Clone,Pod,Copy)]
+#[repr(C, align(16))]
+pub struct RD {
+addr: u64, /* Address of the descriptor's data buffer */
+length: usize, /* Length of data DMAed into data buffer */
+csum: u16, /* Packet checksum */
+status: u8, /* Descriptor status */
+errors: u8, /* Descriptor Errors */
+special: u16,
+}
+//#[derive(Pod)]
+#[repr(C)]
+pub struct PciDeviceE1000 {
+    common_device: PciCommonDevice,
     base: usize,
-    mac_address: [u8; 6],
-    receive_buffer: [Dma<[u8; 16384]>; 16],
-    receive_ring: Dma<[Rd; 16]>,
+    mac_address: EthernetAddr,
+    header: VirtioNetHdr,
+    caps: DeviceCapabilities,
+    receive_buffers: DmaCoherent,
+    receive_ring: DmaCoherent,
     receive_index: usize,
-    transmit_buffer: [Dma<[u8; 16384]>; 16],
-    transmit_ring: Dma<[Td; 16]>,
-    transmit_ring_free: usize,
+
+    transmit_buffers: DmaCoherent,
+    transmit_ring: DmaCoherent,
+    //transmit_ring_free: usize,
     transmit_index: usize,
     transmit_clean_index: usize,
+    //td_dma_coherent:DmaCoherent
+    dma_pool_device: Arc<dma_pool::DmaPool>
 }
 
-#[derive(Copy, Clone)]
-pub enum Handle {
-    Data { flags: usize },
-    Mac { offset: usize },
+impl fmt::Debug for PciDeviceE1000 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PciDeviceE1000")
+            .field("common_device", &self.common_device)
+            .field("base", &self.base)
+            .field("mac_address", &self.mac_address)
+            .field("cap", &self.caps)
+            .field("header", &self.header)
+            .field("receive_index", &self.receive_index)
+            .field("transmit_index", &self.transmit_index)
+            .field("transmit_clean_index", &self.transmit_clean_index)
+            .finish()
+    }
+}
+/* 
+impl AnyNetworkDevice for PciDeviceE1000 {
+    fn mac_addr(&self) -> EthernetAddr {
+        self.mac_address
+    }
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.caps
+        }
+    
+    }*/
+
+
+impl PciDeviceE1000{
+    fn mac_addr(&self) -> EthernetAddr {
+        self.mac_address
+    }
+    pub fn new(common_device: PciCommonDevice,mac_address:EthernetAddr) -> Self{
+        let dma_pool_new = dma_pool::DmaPool::new(
+            mm::PAGE_SIZE,
+            10,
+            50,
+            DmaDirection::Bidirectional,
+            false,
+        );
+        let new_transmission_buffer:Vec<[u8;16384]> = Vec::with_capacity(16);
+        let vm_segment = FrameAllocOptions::new(1)
+        .is_contiguous(true)
+        .alloc_contiguous()
+        .unwrap();
+        let trans_dma_coherent = DmaCoherent::map(vm_segment.clone(), false).unwrap();
+        for i in 0 .. new_transmission_buffer.len(){
+            trans_dma_coherent.write_bytes(i * OFFSET, &new_transmission_buffer[i]).unwrap();
+        }
+        let mut new_transmission_ring:Vec<TD> = Vec::with_capacity(16);
+        for  i in 0 .. new_transmission_ring.len(){
+            let td = TD{
+                addr : (trans_dma_coherent.daddr() + i * OFFSET) as u64,
+                length : 0,
+                cso : 0,
+                cmd : 0,
+                status : 0,
+                css : 0,
+                special : 0,
+            };
+            new_transmission_ring.push(td);
+        } 
+        let vm_segment = FrameAllocOptions::new(1)
+        .is_contiguous(true)
+        .alloc_contiguous()
+        .unwrap();
+        let td_dma_coherent = DmaCoherent::map(vm_segment.clone(), false).unwrap();
+        for i in 0 .. new_transmission_ring.len(){
+            td_dma_coherent.write_val(i * TDOFFSET, &new_transmission_ring[i]).unwrap();
+        }
+        let vm_segment = FrameAllocOptions::new(1)
+        .is_contiguous(true)
+        .alloc_contiguous()
+        .unwrap();
+        let new_receive_buffer:Vec<[u8;16384]> = Vec::with_capacity(16);
+        let recv_dma_coherent = DmaCoherent::map(vm_segment.clone(), false).unwrap();
+        for i in 0 .. new_receive_buffer.len() {
+            recv_dma_coherent.write_bytes(i * OFFSET, &new_receive_buffer[i]).unwrap();
+        }
+        let mut new_receive_ring:Vec<RD> = Vec::with_capacity(16);
+        for  i in 0 .. new_receive_ring.len(){
+            let rd = RD{
+                addr : (recv_dma_coherent.daddr() + i * OFFSET) as u64,
+                length : 0,
+                status:0,
+                csum : 0,
+                errors : 0,
+                special : 0,
+            };
+            new_receive_ring.push(rd);
+        }
+        println!("bytes1:{}",recv_dma_coherent.nbytes());
+        let vm_segment = FrameAllocOptions::new(1)
+        .is_contiguous(true)
+        .alloc_contiguous()
+        .unwrap();
+        let rd_dma_coherent = DmaCoherent::map(vm_segment.clone(), false).unwrap();
+        for i in 0 .. new_receive_buffer.len() {
+            rd_dma_coherent.write_val(i * RDOFFSET, &new_receive_ring[i]).unwrap();
+        }
+        println!("bytes2:{}",rd_dma_coherent.nbytes());
+        let device=PciDeviceE1000{
+            common_device,
+            base: 0,
+            mac_address: mac_address,
+            header: VirtioNetHdr::default(),
+            caps: DeviceCapabilities::default(),
+            receive_ring: recv_dma_coherent,
+            receive_buffers: rd_dma_coherent,
+            receive_index: 0,
+
+            transmit_ring:td_dma_coherent,
+            transmit_buffers:trans_dma_coherent,
+            transmit_index: 0,
+            transmit_clean_index: 0,
+            //td_dma_coherent: dma_coherent
+            dma_pool_device: dma_pool_new,
+        };
+        /*aster_network::register_device(
+            DEVICE_NAME.to_string(),
+            Arc::new(SpinLock::new(device)),
+        );
+        let pci_device=aster_network::get_device(DEVICE_NAME).unwrap().lock();
+        pci_device8*/
+        device
+    }
+
+   
+    /* 
+    pub fn receive_packet(&mut self) -> Result<Vec<u8>, VirtioNetError>{
+        let buffer = self.receive_buffers[self.receive_index].as_ref();
+        let rd = self.receive_ring[self.receive_index].as_ref();
+        let mut reader = (&buffer::segment).reader().unwrap();
+        let packet = [0u8; rd.length];
+        reader.read(&mut VmWriter::from(&mut packet as &mut [u8]));
+        self.receive_index = (self.receive_index + 1) % 64;
+        Ok(packet)
+        //TODO: Implement notify the receive end when the data arrive.
+    }*/
+    pub fn send_packet(&mut self, packet: &[u8]) -> Result<(), VirtioNetError>{
+        if self.transmit_index >= 16 {
+            return Err(VirtioNetError::WrongToken);
+        }
+        let td = TD{
+            addr:(self.transmit_buffers.daddr() + self.transmit_index * OFFSET) as u64,
+            length:packet.len(),
+            cso:0,
+            cmd:0,
+            status:0,
+            css:0,
+            special:0,
+        };
+        self.transmit_ring.write_val(self.transmit_index * TDOFFSET, &td).unwrap();
+        self.transmit_buffers.write_bytes(self.transmit_index * OFFSET, packet);
+        self.transmit_index = (self.transmit_index + 1) % 16;
+        Ok(())
+        //TODO: Implement notify the device when the data is ready.
+    }
+    pub fn recevice_packet(&mut self) -> Result<RxBuffer,VirtioNetError>{
+        let mut rd:RD = self.receive_ring.read_val(self.receive_index * RDOFFSET).unwrap();
+        if rd.status & RD_DD == RD_DD{
+            rd.status = 0;
+            let mut buf :Vec<u8> = Vec::with_capacity(rd.length);
+            let slice:&mut [u8] = buf.as_mut_slice();
+            self.receive_buffers.read_bytes(self.receive_index * RDOFFSET, slice).unwrap();
+            let bars=self.common_device.bar_manager();
+            let bar=bars.bar(0).unwrap();
+            if let Bar::Memory(memory_bar)=&bar{
+                memory_bar.io_mem().write_once(RDT, &self.receive_index).unwrap();
+             }
+            
+            let mut rx_buffer = RxBuffer::new(size_of::<VirtioNetHdr>(), &self.dma_pool_device);
+            rx_buffer.set_packet_len(rd.length - size_of::<VirtioNetHdr>());
+            let mut writer = rx_buffer.get_segment().writer().unwrap();
+            let slice = buf.as_slice();
+            writer.write(&mut VmReader::from(slice));
+            //是否需要写回去
+            self.receive_buffers.write_val(self.receive_index * RDOFFSET, &rd).unwrap();
+            self.receive_index = (self.receive_index + 1) & 16;
+            Ok(rx_buffer)
+        }else{
+            Err(VirtioNetError::NotReady)
+        }
+    }
+
+}
+// static TX_BUFFER_POOL: SpinLock<LinkedList<DmaStream>, LocalIrqDisabled> =
+//     SpinLock::new(LinkedList::new());
+    
+impl PciDevice for PciDeviceE1000 {
+    fn device_id(&self) -> PciDeviceId {
+        self.common_device.device_id().clone()
+    }
 }
 
-fn wrap_ring(index: usize, ring_size: usize) -> usize {
-    (index + 1) & (ring_size - 1)
-}
-
-impl NetworkAdapter for Intel8254x {
-    fn mac_address(&mut self) -> [u8; 6] {
+impl AnyNetworkDevice for PciDeviceE1000 {
+    fn mac_addr(&self) -> EthernetAddr {
         self.mac_address
     }
 
-    fn available_for_read(&mut self) -> usize {
-        let desc = unsafe { &*(self.receive_ring.as_ptr().add(self.receive_index) as *const Rd) };
-
-        if desc.status & RD_DD == RD_DD {
-            return desc.length as usize;
-        }
-
-        0
+    fn capabilities(&self) -> DeviceCapabilities {
+        self.caps.clone()
     }
 
-    fn read_packet(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
-        let desc = unsafe { &mut *(self.receive_ring.as_ptr().add(self.receive_index) as *mut Rd) };
-
-        if desc.status & RD_DD == RD_DD {
-            desc.status = 0;
-
-            let data = &self.receive_buffer[self.receive_index][..desc.length as usize];
-
-            let i = cmp::min(buf.len(), data.len());
-            buf[..i].copy_from_slice(&data[..i]);
-
-            unsafe { self.write_reg(RDT, self.receive_index as u32) };
-            self.receive_index = wrap_ring(self.receive_index, self.receive_ring.len());
-
-            return Ok(Some(i));
-        }
-
-        Ok(None)
+    fn can_receive(&self) -> bool {
+        let rd :RD = self.receive_ring.read_val(self.receive_index * RDOFFSET).unwrap();
+        rd.status == 0
     }
 
-    fn write_packet(&mut self, buf: &[u8]) -> Result<usize> {
-        if self.transmit_ring_free == 0 {
-            loop {
-                let desc = unsafe {
-                    &*(self.transmit_ring.as_ptr().add(self.transmit_clean_index) as *const Td)
-                };
+    fn can_send(&self) -> bool {
+        let td :TD = self.transmit_ring.read_val(self.transmit_index * TDOFFSET).unwrap();
+        td.status == 0
+    }
+ //加了一个get_segment不知道是否可行
+    fn receive(&mut self) -> Result<RxBuffer, VirtioNetError> {
+        self.recevice_packet()
+    }
 
-                if desc.status != 0 {
-                    self.transmit_clean_index =
-                        wrap_ring(self.transmit_clean_index, self.transmit_ring.len());
-                    self.transmit_ring_free += 1;
-                } else if self.transmit_ring_free > 0 {
-                    break;
-                }
-
-                if self.transmit_ring_free >= self.transmit_ring.len() {
-                    break;
-                }
+    fn send(&mut self, packet: &[u8]) -> Result<(), VirtioNetError> {
+        self.send_packet(packet)
+    }
+ //可能有些问题，组会时再讨论
+    fn free_processed_tx_buffers(&mut self) {
+        while let mut td= self.transmit_ring.read_val::<TD>(self.transmit_clean_index * TDOFFSET).unwrap(){
+            if td.status != 0 {
+                td.status = 0;
+                self.transmit_ring.write_val(self.transmit_index * TDOFFSET, &td).unwrap();
+                self.transmit_clean_index += 1;
+            }else {
+                break;
             }
         }
-
-        let desc =
-            unsafe { &mut *(self.transmit_ring.as_ptr().add(self.transmit_index) as *mut Td) };
-
-        let data = unsafe {
-            slice::from_raw_parts_mut(
-                self.transmit_buffer[self.transmit_index].as_ptr() as *mut u8,
-                cmp::min(buf.len(), self.transmit_buffer[self.transmit_index].len()) as usize,
-            )
-        };
-
-        let i = cmp::min(buf.len(), data.len());
-        data[..i].copy_from_slice(&buf[..i]);
-
-        desc.cso = 0;
-        desc.command = TD_CMD_EOP | TD_CMD_IFCS | TD_CMD_RS;
-        desc.status = 0;
-        desc.css = 0;
-        desc.special = 0;
-
-        desc.length = (cmp::min(
-            buf.len(),
-            self.transmit_buffer[self.transmit_index].len() - 1,
-        )) as u16;
-
-        self.transmit_index = wrap_ring(self.transmit_index, self.transmit_ring.len());
-        self.transmit_ring_free -= 1;
-
-        unsafe { self.write_reg(TDT, self.transmit_index as u32) };
-
-        Ok(i)
     }
 }
-
-fn dma_array<T, const N: usize>() -> Result<[Dma<T>; N]> {
-    Ok((0..N)
-        .map(|_| Ok(unsafe { Dma::zeroed()?.assume_init() }))
-        .collect::<Result<Vec<_>>>()?
-        .try_into()
-        .unwrap_or_else(|_| unreachable!()))
+#[derive(Debug)]
+pub struct PciDriverE1000 {
+    devices: Mutex<Vec<Arc<PciDeviceE1000>>>,
 }
-impl Intel8254x {
-    pub unsafe fn new(base: usize) -> Result<Self> {
-        #[rustfmt::skip]
-        let mut module = Intel8254x {
-            base,
-            mac_address: [0; 6],
-            receive_buffer: dma_array()?,
-            receive_ring: Dma::zeroed()?.assume_init(),
-            transmit_buffer: dma_array()?,
-            receive_index: 0,
-            transmit_ring: Dma::zeroed()?.assume_init(),
-            transmit_ring_free: 16,
-            transmit_index: 0,
-            transmit_clean_index: 0,
-        };
-
-        module.init();
-
-        Ok(module)
+fn flag(memory_bar: &Arc<MemoryBar>,register: usize,flag: u32,value : bool){
+    if value {
+        memory_bar.io_mem().write_once(register,&(memory_bar.io_mem().read_once::<u32>(register as usize).unwrap() | flag)).unwrap();
+    }else {
+        memory_bar.io_mem().write_once(register,&(memory_bar.io_mem().read_once::<u32>(register as usize).unwrap() & !flag)).unwrap();
     }
-
-    pub unsafe fn irq(&self) -> bool {
-        let icr = self.read_reg(ICR);
-        icr != 0
-    }
-
-    pub unsafe fn read_reg(&self, register: u32) -> u32 {
-        ptr::read_volatile((self.base + register as usize) as *mut u32)
-    }
-
-    pub unsafe fn write_reg(&self, register: u32, data: u32) -> u32 {
-        ptr::write_volatile((self.base + register as usize) as *mut u32, data);
-        ptr::read_volatile((self.base + register as usize) as *mut u32)
-    }
-
-    pub unsafe fn flag(&self, register: u32, flag: u32, value: bool) {
-        if value {
-            self.write_reg(register, self.read_reg(register) | flag);
-        } else {
-            self.write_reg(register, self.read_reg(register) & !flag);
+}
+impl PciDriver for PciDriverE1000 {
+    fn probe(
+        &self,
+        device: PciCommonDevice
+    ) -> Result<Arc<dyn PciDevice>, (BusProbeError, PciCommonDevice)> {
+        // 检查设备是否匹配
+        if device.device_id().vendor_id != 0x8086 || device.device_id().device_id != 0x100E {
+            // 0x8086 是 Intel 的 Vendor ID，0x100E 是 e1000 的 Device ID
+            return Err((BusProbeError::DeviceNotMatch, device));
         }
-    }
+        // 创建 DMA 池
+        // let dma_pool_new = dma_pool::DmaPool::new(
+        //     mm::PAGE_SIZE,
+        //     10,
+        //     50,
+        //     DmaDirection::Bidirectional,
+        //     false
+        // );
 
-    pub unsafe fn init(&mut self) {
-        self.flag(CTRL, CTRL_RST, true);
-        while self.read_reg(CTRL) & CTRL_RST == CTRL_RST {
-            print!("   - Waiting for reset: {:X}\n", self.read_reg(CTRL));
+        // 获取设备的 MAC 地址，假设可以从设备配置空间读取
+        const RAL0:usize=0x5400;
+        const RAH0: usize= 0x5404;
+        const CTRL:usize=0x0;
+        const STATUS:usize=0x8;
+        const TDT : usize=0x3818;
+        const TDLEN : usize=0x3808;
+        const TDBAL : usize=0x3800;
+        const TDBAH : usize=0x3804;
+        const TCTL : usize=0x400;
+        const TCTL_EN : u32=1 << 1;
+        const TCTL_PSP : u32=1 << 3; 
+        let bars=device.bar_manager();
+        let bar=bars.bar(0).unwrap();
+        let mut mac_low:u32=0;
+        let mut mac_high:u32=0;
+        let mut ctl:u32=0;
+        let mut status:u32=0;
+        // 创建 PciDeviceE1000 的实例
+        
+        if let Bar::Memory(memory_bar)=&bar{
+            ctl=memory_bar.io_mem().read_once(CTRL).unwrap();
+            status=memory_bar.io_mem().read_once(STATUS).unwrap();
+            mac_low=memory_bar.io_mem().read_once(RAL0).unwrap();
+            mac_high=memory_bar.io_mem().read_once(RAH0).unwrap();
+         }
+         let pci_device = Arc::new(PciDeviceE1000 ::new(device, aster_network::EthernetAddr([0, 0, 0, 0, 0, 0])));
+        // 将设备添加到驱动的设备列表
+        // println!("{:?}",pci_device);
+        self.devices.lock().push(pci_device.clone());
+        if let Bar::Memory(new_memory_bar) =&bar{
+            new_memory_bar.io_mem().write_once(TDT ,&pci_device.transmit_index).unwrap();
+            new_memory_bar.io_mem().write_once(TDLEN , &(TDOFFSET * 16)).unwrap();
+            new_memory_bar.io_mem().write_once(TDBAH , &(((pci_device.transmit_ring.paddr() as u64) >> 32) as u32)).unwrap();
+            new_memory_bar.io_mem().write_once(TDBAL as usize, &(pci_device.transmit_ring.paddr() as u32)).unwrap();
+            flag(&new_memory_bar, TCTL as usize, TCTL_EN, true);
+            flag(&new_memory_bar, TCTL as usize, TCTL_PSP, true);
         }
-
-        // Enable auto negotiate, link, clear reset, do not Invert Loss-Of Signal
-        self.flag(CTRL, CTRL_ASDE | CTRL_SLU, true);
-        self.flag(CTRL, CTRL_LRST | CTRL_PHY_RST | CTRL_ILOS, false);
-
-        // No flow control
-        self.write_reg(FCAH, 0);
-        self.write_reg(FCAL, 0);
-        self.write_reg(FCT, 0);
-        self.write_reg(FCTTV, 0);
-
-        // Do not use VLANs
-        self.flag(CTRL, CTRL_VME, false);
-
-        // TODO: Clear statistical counters
-
-        let mac_low = self.read_reg(RAL0);
-        let mac_high = self.read_reg(RAH0);
-        let mac = [
-            mac_low as u8,
-            (mac_low >> 8) as u8,
-            (mac_low >> 16) as u8,
-            (mac_low >> 24) as u8,
-            mac_high as u8,
-            (mac_high >> 8) as u8,
-        ];
-        print!(
-            "{}",
-            format!(
-                "   - MAC: {:>02X}:{:>02X}:{:>02X}:{:>02X}:{:>02X}:{:>02X}\n",
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
-            )
+         println!("Read value: {:?}", ctl);
+         println!("Read value: {:?}", status);
+         println!("Read value: {:x?}", mac_low);
+         aster_network::register_device(
+            DEVICE_NAME.to_string(),
+            Arc::new(SpinLock::new(pci_device)),
         );
-        self.mac_address = mac;
+        // 返回创建的设备
+        Ok(pci_device.clone())
+    }}
 
-        //
-        // MTA => 0;
-        //
 
-        // Receive Buffer
-        for i in 0..self.receive_ring.len() {
-            self.receive_ring[i].buffer = self.receive_buffer[i].physical() as u64;
-        }
-
-        self.write_reg(RDBAH, ((self.receive_ring.physical() as u64) >> 32) as u32);
-        self.write_reg(RDBAL, self.receive_ring.physical() as u32);
-        self.write_reg(
-            RDLEN,
-            (self.receive_ring.len() * mem::size_of::<Rd>()) as u32,
-        );
-        self.write_reg(RDH, 0);
-        self.write_reg(RDT, self.receive_ring.len() as u32 - 1);
-
-        // Transmit Buffer
-        for i in 0..self.transmit_ring.len() {
-            self.transmit_ring[i].buffer = self.transmit_buffer[i].physical() as u64;
-        }
-
-        self.write_reg(TDBAH, ((self.transmit_ring.physical() as u64) >> 32) as u32);
-        self.write_reg(TDBAL, self.transmit_ring.physical() as u32);
-        self.write_reg(
-            TDLEN,
-            (self.transmit_ring.len() * mem::size_of::<Td>()) as u32,
-        );
-        self.write_reg(TDH, 0);
-        self.write_reg(TDT, 0);
-
-        self.write_reg(IMS, IMS_RXT | IMS_RX | IMS_RXDMT | IMS_RXSEQ); // | IMS_LSC | IMS_TXQE | IMS_TXDW
-
-        self.flag(RCTL, RCTL_EN, true);
-        self.flag(RCTL, RCTL_UPE, true);
-        // self.flag(RCTL, RCTL_MPE, true);
-        self.flag(RCTL, RCTL_LPE, true);
-        self.flag(RCTL, RCTL_LBM, false);
-        // RCTL.RDMTS = Minimum threshold size ???
-        // RCTL.MO = Multicast offset
-        self.flag(RCTL, RCTL_BAM, true);
-        self.flag(RCTL, RCTL_BSIZE1, true);
-        self.flag(RCTL, RCTL_BSIZE2, false);
-        self.flag(RCTL, RCTL_BSEX, true);
-        self.flag(RCTL, RCTL_SECRC, true);
-
-        self.flag(TCTL, TCTL_EN, true);
-        self.flag(TCTL, TCTL_PSP, true);
-        // TCTL.CT = Collision threshold
-        // TCTL.COLD = Collision distance
-        // TIPG Packet Gap
-        // TODO ...
-
-        while self.read_reg(STATUS) & 2 != 2 {
-            print!("   - Waiting for link up: {:X}\n", self.read_reg(STATUS));
-        }
-        print!(
-            "   - Link is up with speed {}\n",
-            match (self.read_reg(STATUS) >> 6) & 0b11 {
-                0b00 => "10 Mb/s",
-                0b01 => "100 Mb/s",
-                _ => "1000 Mb/s",
-            }
-        );
-    }
+pub fn driver_e1000_init() {
+    let driver_a = Arc::new(PciDriverE1000 {
+        //修改Mutex
+        devices: Mutex::new(Vec::new()),
+    });
+    PCI_BUS.lock().register_driver(driver_a);
 }
